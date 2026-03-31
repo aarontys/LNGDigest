@@ -37,7 +37,7 @@ In the Railway dashboard → your service → "Variables" tab → add these 3:
 | Variable Name        | Value                        |
 |----------------------|------------------------------|
 | `TELEGRAM_BOT_TOKEN` | your new bot token           |
-| `TELEGRAM_CHAT_ID`   | XXXX                   |
+| `TELEGRAM_CHAT_ID`   | XXXX                         |
 | `ANTHROPIC_API_KEY`  | your new Anthropic API key   |
 
 ### 5. Deploy
@@ -71,7 +71,7 @@ In the Railway dashboard → your service → "Variables" tab → add these 3:
 ```
 pip install feedparser requests anthropic
 set TELEGRAM_BOT_TOKEN=your_token
-set TELEGRAM_CHAT_ID=1037738009
+set TELEGRAM_CHAT_ID=XXXX
 set ANTHROPIC_API_KEY=your_key
 python lng_digest.py
 ```
