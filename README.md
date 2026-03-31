@@ -37,7 +37,7 @@ In the Railway dashboard → your service → "Variables" tab → add these 3:
 | Variable Name        | Value                        |
 |----------------------|------------------------------|
 | `TELEGRAM_BOT_TOKEN` | your new bot token           |
-| `TELEGRAM_CHAT_ID`   | 1037738009                   |
+| `TELEGRAM_CHAT_ID`   | XXXX                   |
 | `ANTHROPIC_API_KEY`  | your new Anthropic API key   |
 
 ### 5. Deploy
