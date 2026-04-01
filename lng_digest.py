@@ -26,8 +26,7 @@ ANTHROPIC_API_KEY    = os.environ["ANTHROPIC_API_KEY"]
 
 # ── Settings ───────────────────────────────────────────────────────────────────
 SGT                  = timezone(timedelta(hours=8))   # Singapore Time (UTC+8)
-DAILY_HOUR           = 7
-DAILY_MINUTE         = 0
+DAILY_TIMES          = [(8, 0), (12, 0), (19, 0)]    # 8am, 12pm, 7pm SGT
 WEEKLY_HOUR          = 7
 WEEKLY_MINUTE        = 30
 MONTHLY_HOUR         = 8
@@ -412,26 +411,32 @@ def should_run(hour: int, minute: int) -> bool:
 
 def main():
     log.info("🚀 LNG Intelligence Pipeline starting…")
-    log.info(f"   Daily digest  : {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} SGT")
-    log.info(f"   Weekly summary: Monday {WEEKLY_HOUR:02d}:{WEEKLY_MINUTE:02d} SGT")
-    log.info(f"   Monthly report: 1st of month {MONTHLY_HOUR:02d}:{MONTHLY_MINUTE:02d} SGT")
+    log.info(f"   Daily digests : 8:00 AM, 12:00 PM, 7:00 PM SGT")
+    log.info(f"   Weekly summary: Monday 7:30 AM SGT")
+    log.info(f"   Monthly report: 1st of month 8:00 AM SGT")
 
     # Run once on startup to confirm everything works
     log.info("Running startup test digest…")
     run_digest()
 
-    last_daily   = None
+    last_run_times = set()  # Track which (hour, minute) combos we've already run
     last_weekly  = None
     last_monthly = None
 
     while True:
         now_sgt = datetime.now(SGT)
         today   = now_sgt.date()
+        current_time = (now_sgt.hour, now_sgt.minute, today)
 
-        # Daily at 07:00 SGT
-        if should_run(DAILY_HOUR, DAILY_MINUTE) and last_daily != today:
-            last_daily = today
-            run_digest()
+        # Daily at 08:00, 12:00, 19:00 SGT
+        for hour, minute in DAILY_TIMES:
+            run_key = (hour, minute, today)
+            if should_run(hour, minute) and run_key not in last_run_times:
+                log.info(f"Running digest at {hour:02d}:{minute:02d} SGT")
+                run_digest()
+                last_run_times.add(run_key)
+                # Clean up old entries from yesterday to prevent memory growth
+                last_run_times = {k for k in last_run_times if k[2] == today}
 
         # Weekly: Monday at 07:30 SGT
         if (now_sgt.weekday() == 0
