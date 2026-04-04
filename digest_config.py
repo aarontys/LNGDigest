@@ -16,7 +16,7 @@ from datetime import datetime
 TELEGRAM_RECIPIENTS = [
     (os.getenv("TELEGRAM_CHAT_ID"), "You"),  # Primary recipient
     # Uncomment and add colleague details when ready:
-    # (os.getenv("COLLEAGUE_TELEGRAM_CHAT_ID"), "Colleague Name"),
+    (os.getenv("COLLEAGUE_TELEGRAM_CHAT_ID"), "Jennifer"),
 ]
 
 # Fallback for single recipient (legacy support)
