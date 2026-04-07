@@ -5,6 +5,14 @@
 
 import os
 from datetime import datetime
+import pytz
+
+# ==============================================================================
+# TIMEZONE SETUP (SGT - Singapore Time, UTC+8)
+# ==============================================================================
+# This ensures digests run at correct SGT times regardless of server timezone
+SGT = pytz.timezone("Asia/Singapore")
+TIMEZONE = "Asia/Singapore"
 
 # ==============================================================================
 # TELEGRAM RECIPIENTS - Option 3 Multi-Recipient Setup
@@ -16,7 +24,7 @@ from datetime import datetime
 TELEGRAM_RECIPIENTS = [
     (os.getenv("TELEGRAM_CHAT_ID"), "You"),  # Primary recipient
     # Uncomment and add colleague details when ready:
-    (os.getenv("COLLEAGUE_TELEGRAM_CHAT_ID"), "Jennifer"),
+    # (os.getenv("COLLEAGUE_TELEGRAM_CHAT_ID"), "Colleague Name"),
 ]
 
 # Fallback for single recipient (legacy support)
@@ -28,11 +36,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Three daily digest sends in Singapore Time (SGT, UTC+8)
 DAILY_TIMES = [
     (8, 0),    # 8:00 AM SGT
-    (2, 0),   # 12:00 PM SGT
+    (12, 0),   # 12:00 PM SGT
     (19, 0),   # 7:00 PM SGT
 ]
-
-TIMEZONE = "Asia/Singapore"
 
 # ==============================================================================
 # RSS FEEDS

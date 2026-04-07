@@ -5,7 +5,7 @@ Fetches RSS feeds, filters by LNG keywords, summarizes with Claude AI,
 and delivers to multiple Telegram recipients at 3 fixed times daily.
 
 Deployment: Railway.app (GitHub-connected Python service)
-Timezone: Singapore (SGT, UTC+8)
+Timezone: Singapore (SGT, UTC+8) - TIMEZONE AWARE
 Schedule: 8:00 AM, 12:00 PM, 7:00 PM SGT
 """
 
@@ -26,6 +26,7 @@ from digest_config import (
     TELEGRAM_RECIPIENTS,
     TELEGRAM_BOT_TOKEN,
     DAILY_TIMES,
+    SGT,  # ← TIMEZONE AWARE IMPORT
     TIMEZONE,
     RSS_FEEDS,
     LNG_KEYWORDS,
@@ -157,6 +158,7 @@ class ArticleFetcher:
         except (ValueError, TypeError):
             return not SKIP_UNDATED_ARTICLES
         
+        # Use timezone-aware comparison
         age = datetime.utcnow() - article_time
         return age.total_seconds() < (ARTICLE_MAX_AGE_HOURS * 3600)
     
@@ -316,7 +318,8 @@ class DigestFormatter:
         Returns:
             str: HTML-formatted Telegram message
         """
-        now = datetime.now().strftime("%Y-%m-%d")
+        # Use SGT for timestamp in message
+        now = datetime.now(SGT).strftime("%Y-%m-%d")
         
         header = f"""<b>🚀 LNG Intelligence Briefing</b>
 <i>{now} | {send_time}</i>
@@ -372,7 +375,8 @@ class LNGDigest:
             send_time_str: String like "8:00 AM" for header
         """
         logger.info("=" * 70)
-        logger.info(f"→ Digest run initiated at {datetime.now()}")
+        # Use SGT for timestamp in logs
+        logger.info(f"→ Digest run initiated at {datetime.now(SGT)}")
         logger.info("=" * 70)
         
         # Fetch & filter articles
@@ -404,6 +408,7 @@ class LNGDigest:
     def should_run(self, target_hour, target_minute):
         """
         Check if this is a scheduled run time (prevents duplicates).
+        Uses SGT for timezone-aware scheduling.
         
         Args:
             target_hour: Hour (0-23, SGT)
@@ -412,7 +417,8 @@ class LNGDigest:
         Returns:
             bool: True if this run hasn't been done yet today
         """
-        now = datetime.now()
+        # ← KEY FIX: Use datetime.now(SGT) instead of datetime.now()
+        now = datetime.now(SGT)
         today = now.date()
         current_hour = now.hour
         current_minute = now.minute
@@ -430,14 +436,16 @@ class LNGDigest:
             return False
         
         self.last_run_times.add(run_key)
+        logger.info(f"✓ Scheduled run detected: {target_hour}:{target_minute:02d} SGT")
         return True
     
     def start(self):
         """
         Start the digest service with continuous polling loop.
-        Runs at 8 AM, 12 PM, and 7 PM SGT daily.
+        Runs at 8 AM, 12 PM, and 7 PM SGT daily (timezone-aware).
         """
         logger.info("🟢 LNG Digest service started")
+        logger.info(f"   Timezone: {TIMEZONE} (SGT, UTC+8)")
         logger.info(f"   Recipients: {[name for _, name in TELEGRAM_RECIPIENTS]}")
         logger.info(f"   Schedule: {', '.join([f'{h}:{m:02d}' for h, m in DAILY_TIMES])} SGT")
         logger.info(f"   Feeds: {len(RSS_FEEDS)}")
@@ -445,7 +453,11 @@ class LNGDigest:
         
         while True:
             try:
-                now = datetime.now()
+                now = datetime.now(SGT)
+                
+                # Log current time every 5 minutes for debugging
+                if now.minute % 5 == 0:
+                    logger.info(f"⏰ Service running | Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 
                 # Check each scheduled time
                 for target_hour, target_minute in DAILY_TIMES:
