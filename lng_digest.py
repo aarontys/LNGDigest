@@ -1,483 +1,571 @@
 #!/usr/bin/env python3
 """
-LNG Intelligence Pipeline - Daily Digest
+LNG Intelligence Pipeline — Daily Digest
+==========================================
 Fetches RSS feeds, filters by LNG keywords, summarizes with Claude AI,
-and delivers to multiple Telegram recipients at 3 fixed times daily.
+and delivers formatted briefings to Telegram.
 
-Deployment: Railway.app (GitHub-connected Python service)
-Timezone: Singapore (SGT, UTC+8) - TIMEZONE AWARE
-Schedule: 8:00 AM, 12:00 PM, 7:00 PM SGT
+Deployment: Railway.app (GitHub-connected, always-on Python service)
+Timezone:   Singapore (SGT, UTC+8)
+Schedule:   8:00 AM, 12:00 PM, 7:00 PM SGT
+
+Setup:
+  pip install feedparser requests anthropic
+
+Run locally:
+  python lng_digest.py              # starts polling loop
+  python lng_digest.py --test       # sends one digest immediately, then exits
+  python lng_digest.py --diagnose   # tests all feeds and prints diagnostics
 """
 
 import os
 import sys
+import io
 import json
-import logging
-from datetime import datetime, timedelta
-import time
-import re
 import hashlib
+import logging
+import time
+import argparse
+from datetime import datetime, timezone, timedelta
 
 import feedparser
 import requests
-from anthropic import Anthropic
+import anthropic
 
-from digest_config import (
-    TELEGRAM_RECIPIENTS,
-    TELEGRAM_BOT_TOKEN,
-    DAILY_TIMES,
-    SGT,  # ← TIMEZONE AWARE IMPORT
-    TIMEZONE,
-    RSS_FEEDS,
-    LNG_KEYWORDS,
-    ARTICLE_MAX_AGE_HOURS,
-    SKIP_UNDATED_ARTICLES,
-    ANTHROPIC_API_KEY,
-    CLAUDE_MODEL,
-    DIGEST_CATEGORIES,
-    SEEN_ARTICLES_FILE,
-    LOG_FILE,
-    LOG_LEVEL,
-    LOG_FORMAT,
-)
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION (env vars for Railway, fallback to digest_config.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ==============================================================================
-# LOGGING SETUP
-# ==============================================================================
+# --- Credentials (env vars take priority, digest_config.py as fallback) ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Multi-recipient support: list of (chat_id, display_name) tuples
+# Built from env vars — add COLLEAGUE_TELEGRAM_CHAT_ID, COLLEAGUE_2_TELEGRAM_CHAT_ID etc.
+TELEGRAM_RECIPIENTS = None  # Will be populated below
+
+# Fall back to digest_config.py if env vars are empty
+try:
+    import digest_config as _cfg
+    TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or getattr(_cfg, "TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID   = TELEGRAM_CHAT_ID or getattr(_cfg, "TELEGRAM_CHAT_ID", "")
+    ANTHROPIC_API_KEY   = ANTHROPIC_API_KEY or getattr(_cfg, "ANTHROPIC_API_KEY", "")
+    # If digest_config defines TELEGRAM_RECIPIENTS, use it directly
+    TELEGRAM_RECIPIENTS = getattr(_cfg, "TELEGRAM_RECIPIENTS", None)
+except ImportError:
+    pass
+
+# Build recipients list if not already set by digest_config
+if not TELEGRAM_RECIPIENTS:
+    TELEGRAM_RECIPIENTS = []
+    # Primary recipient (you)
+    if TELEGRAM_CHAT_ID:
+        TELEGRAM_RECIPIENTS.append((TELEGRAM_CHAT_ID, "Primary"))
+    # Additional recipients from env vars (COLLEAGUE_TELEGRAM_CHAT_ID, COLLEAGUE_2_...)
+    for key, val in os.environ.items():
+        if key.endswith("_TELEGRAM_CHAT_ID") and key != "TELEGRAM_CHAT_ID":
+            name = key.replace("_TELEGRAM_CHAT_ID", "").replace("_", " ").title()
+            TELEGRAM_RECIPIENTS.append((val, name))
+
+# --- Timezone ---
+SGT = timezone(timedelta(hours=8))
+
+# --- Schedule: (hour, minute) tuples in SGT ---
+DAILY_TIMES = [(8, 0), (12, 0), (19, 0)]
+
+# --- Files ---
+SEEN_FILE = "seen_articles.json"
+HISTORY_FILE = "article_history.json"
+LOG_FILE  = "lng_digest.log"
+
+# --- Limits ---
+MAX_ARTICLES_PER_RUN   = 30
+ARTICLE_MAX_AGE_HOURS  = 48
+SKIP_UNDATED_ARTICLES  = True
+
+# --- Claude ---
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RSS FEEDS — verified, working sources (Apr 2025)
+# ══════════════════════════════════════════════════════════════════════════════
+RSS_FEEDS = [
+    # --- Major Wire Services & News ---
+    "https://news.google.com/rss/search?q=LNG+liquefied+natural+gas&hl=en&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=LNG+terminal+OR+LNG+cargo+OR+LNG+shipment&hl=en&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=natural+gas+price+spot+market&hl=en&gl=US&ceid=US:en",
+
+    # --- Energy-Specific Sources ---
+    "https://oilprice.com/rss/main",
+    "https://www.rigzone.com/news/rss/rigzone_latest.aspx",
+    "https://www.offshore-energy.biz/feed/",
+    "https://www.upstreamonline.com/rss",
+    "https://www.spglobal.com/commodityinsights/en/rss-feed/natural-gas",
+    "https://www.naturalgasintel.com/feed/",
+    "https://www.hellenicshippingnews.com/category/lng/feed/",
+    "https://splash247.com/feed/",
+
+    # --- General Energy & Geopolitics ---
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Energy.xml",
+
+    # --- Industry Bodies ---
+    "https://www.eia.gov/rss/todayinenergy.xml",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KEYWORDS — terms that indicate LNG relevance
+# ══════════════════════════════════════════════════════════════════════════════
+KEYWORDS = [
+    "lng", "liquefied natural gas", "natural gas",
+    "henry hub", "ttf", "jkm", "nbp",
+    "regasification", "liquefaction", "fsru", "flng",
+    "gas terminal", "gas pipeline", "gas export", "gas import",
+    "gas cargo", "gas shipment", "gas tanker",
+    "gas price", "gas spot", "gas market", "gas trade",
+    "gas supply", "gas demand",
+    "cheniere", "venture global", "sempra", "tellurian", "driftwood",
+    "qatar energy", "qatargas", "novatek", "yamal", "arctic lng",
+    "santos", "woodside", "petronas lng", "shell lng", "totalenergies lng",
+    "bp lng", "equinor lng", "eni lng", "chevron lng", "conocophillips lng",
+    "sabine pass", "freeport lng", "cameron lng", "corpus christi",
+    "golden pass", "port arthur lng", "plaquemines",
+    "energy security", "gas sanctions", "energy transition",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATEGORIES — for AI-driven grouping
+# ══════════════════════════════════════════════════════════════════════════════
+CATEGORIES = {
+    "📊 Market Prices & Trade Flows": [
+        "price", "spot", "cargo", "trade", "export", "import",
+        "shipment", "tanker", "supply", "demand", "henry hub", "ttf", "jkm",
+    ],
+    "🌍 Policy & Geopolitics": [
+        "policy", "sanction", "government", "geopolit", "treaty",
+        "regulation", "minister", "summit", "war", "conflict", "election",
+    ],
+    "🏗️ Infrastructure & Terminals": [
+        "terminal", "regasification", "liquefaction", "fsru", "pipeline",
+        "port", "construction", "capacity", "infrastructure", "project", "plant",
+    ],
+    "🏢 Company News & Deals": [
+        "deal", "acquisition", "merger", "contract", "agreement",
+        "partnership", "investment", "company", "corp", "ipo", "quarterly", "earnings",
+    ],
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format=LOG_FORMAT,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")),
     ],
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ==============================================================================
-# TELEGRAM SERVICE
-# ==============================================================================
-class TelegramService:
-    """Handles sending messages to multiple Telegram recipients."""
-    
-    def __init__(self, bot_token):
-        self.bot_token = bot_token
-        self.base_url = f"https://api.telegram.org/bot{bot_token}"
-    
-    def send_message(self, text, chat_id, parse_mode="HTML"):
-        """
-        Send formatted message to a recipient.
-        
-        Args:
-            text: Message content (HTML-formatted)
-            chat_id: Telegram chat ID
-            parse_mode: "HTML" or "Markdown"
-        
-        Returns:
-            bool: True if sent successfully, False otherwise
-        """
-        try:
-            url = f"{self.base_url}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": False,
-            }
-            response = requests.post(url, json=payload, timeout=10)
-            
-            if response.status_code == 200:
-                logger.info(f"✓ Message sent to {chat_id}")
-                return True
-            else:
-                logger.error(f"✗ Failed to send to {chat_id}: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"✗ Telegram error for {chat_id}: {str(e)}")
-            return False
-    
-    def send_to_all_recipients(self, text, recipients):
-        """
-        Send message to all configured recipients.
-        
-        Args:
-            text: Message content
-            recipients: List of (chat_id, recipient_name) tuples
-        
-        Returns:
-            dict: Results per recipient
-        """
-        results = {}
-        for chat_id, recipient_name in recipients:
-            if not chat_id:
-                logger.warning(f"⚠ Skipping {recipient_name}: no chat_id configured")
-                results[recipient_name] = False
-                continue
-            
-            logger.info(f"→ Sending to {recipient_name} ({chat_id})")
-            success = self.send_message(text, chat_id)
-            results[recipient_name] = success
-            time.sleep(0.5)  # Rate limiting between sends
-        
-        return results
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLAUDE CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ==============================================================================
-# ARTICLE FETCHING & FILTERING
-# ==============================================================================
-class ArticleFetcher:
-    """Fetches and filters articles from RSS feeds."""
-    
-    def __init__(self):
-        self.seen_articles = self._load_seen_articles()
-    
-    def _load_seen_articles(self):
-        """Load set of previously seen article hashes."""
-        if os.path.exists(SEEN_ARTICLES_FILE):
-            with open(SEEN_ARTICLES_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        return set()
-    
-    def _save_seen_articles(self):
-        """Persist seen articles to disk."""
-        with open(SEEN_ARTICLES_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(self.seen_articles), f, indent=2)
-        logger.info(f"✓ Saved {len(self.seen_articles)} article hashes")
-    
-    def _hash_article(self, title, link):
-        """Create deterministic hash for article deduplication."""
-        content = f"{title}|{link}".encode("utf-8")
-        return hashlib.md5(content).hexdigest()
-    
-    def _is_recent(self, pub_date):
-        """Check if article is within max age threshold."""
-        if not pub_date:
-            return not SKIP_UNDATED_ARTICLES
-        
-        try:
-            article_time = datetime(*pub_date[:6])
-        except (ValueError, TypeError):
-            return not SKIP_UNDATED_ARTICLES
-        
-        # Use timezone-aware comparison
-        age = datetime.utcnow() - article_time
-        return age.total_seconds() < (ARTICLE_MAX_AGE_HOURS * 3600)
-    
-    def _is_lng_relevant(self, title, summary):
-        """Check if article matches LNG keywords."""
-        text = f"{title} {summary}".lower()
-        return any(keyword.lower() in text for keyword in LNG_KEYWORDS)
-    
-    def fetch_articles(self):
-        """
-        Fetch and filter articles from all RSS feeds.
-        
-        Returns:
-            list: Filtered article dicts with keys:
-                  title, link, summary, pub_date, source_feed
-        """
-        articles = []
-        
-        logger.info(f"→ Fetching from {len(RSS_FEEDS)} feeds...")
-        
-        for feed_url in RSS_FEEDS:
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEEN ARTICLES (deduplication)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_seen() -> set:
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_seen(seen: set):
+    # Keep only last 5000 hashes to prevent file bloat
+    trimmed = list(seen)[-5000:]
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(trimmed, f)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ARTICLE HISTORY (for weekly/monthly summaries)
+# ══════════════════════════════════════════════════════════════════════════════
+def save_to_history(articles: list[dict]):
+    """Append articles to history file for weekly/monthly summary generation."""
+    history = []
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, encoding="utf-8") as f:
             try:
-                feed = feedparser.parse(feed_url)
-                
-                if feed.bozo:
-                    logger.warning(f"⚠ Feed parse warning: {feed_url}")
-                
-                for entry in feed.entries[:10]:  # Limit per feed
-                    title = entry.get("title", "No title")
-                    link = entry.get("link", "")
-                    summary = entry.get("summary", "")
-                    pub_date = entry.get("published_parsed", None)
-                    
-                    # Deduplication
-                    article_hash = self._hash_article(title, link)
-                    if article_hash in self.seen_articles:
-                        continue
-                    
-                    # Age filter
-                    if not self._is_recent(pub_date):
-                        continue
-                    
-                    # LNG relevance
-                    if not self._is_lng_relevant(title, summary):
-                        continue
-                    
-                    articles.append({
-                        "title": title,
-                        "link": link,
-                        "summary": summary[:300],  # Truncate for API efficiency
-                        "pub_date": pub_date,
-                        "source_feed": feed.feed.get("title", feed_url),
-                        "hash": article_hash,
-                    })
-                    
-                    self.seen_articles.add(article_hash)
-                
-            except Exception as e:
-                logger.error(f"✗ Error fetching {feed_url}: {str(e)}")
-                continue
-        
-        self._save_seen_articles()
-        logger.info(f"✓ Fetched and filtered {len(articles)} articles")
-        
-        return articles
+                history = json.load(f)
+            except json.JSONDecodeError:
+                history = []
 
-# ==============================================================================
-# CLAUDE SUMMARIZATION
-# ==============================================================================
-class DigestSummarizer:
-    """Summarizes and categorizes articles using Claude AI."""
-    
-    def __init__(self, api_key):
-        self.client = Anthropic(api_key=api_key)
-    
-    def summarize_articles(self, articles):
-        """
-        Summarize articles into predefined categories using Claude.
-        
-        Args:
-            articles: List of article dicts
-        
-        Returns:
-            dict: Categorized summaries
-        """
-        if not articles:
-            return {}
-        
-        # Prepare article list for Claude
-        article_text = "\n\n".join([
-            f"Title: {a['title']}\n"
-            f"Link: {a['link']}\n"
-            f"Summary: {a['summary']}"
-            for a in articles
-        ])
-        
-        prompt = f"""Analyze the following LNG industry articles and categorize them into these 4 categories:
-1. Market Prices & Trade Flows
-2. Policy & Geopolitics
-3. Infrastructure & Terminals
-4. Company News & Deals
+    for a in articles:
+        history.append({
+            "title":   a["title"],
+            "url":     a["url"],
+            "summary": a["summary"],
+            "source":  a["source"],
+            "date":    datetime.now(SGT).isoformat(),
+        })
 
-For each category, provide a 2-3 sentence summary highlighting key developments.
-If no articles fit a category, skip it.
+    # Keep last 30 days of history
+    cutoff = (datetime.now(SGT) - timedelta(days=30)).isoformat()
+    history = [h for h in history if h.get("date", "") >= cutoff]
 
-Articles:
-{article_text}
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    log.info(f"Saved {len(articles)} articles to history ({len(history)} total)")
 
-Format your response EXACTLY as:
-**Market Prices & Trade Flows**
-[summary or "None today"]
 
-**Policy & Geopolitics**
-[summary or "None today"]
+# ══════════════════════════════════════════════════════════════════════════════
+#  FETCH & FILTER ARTICLES
+# ══════════════════════════════════════════════════════════════════════════════
+def parse_pub_date(entry) -> datetime | None:
+    """Safely parse an RSS entry's publish date as UTC-aware datetime."""
+    published = entry.get("published_parsed")
+    if not published:
+        return None
+    try:
+        # published_parsed is a time.struct_time; treat as UTC
+        return datetime(*published[:6], tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
-**Infrastructure & Terminals**
-[summary or "None today"]
 
-**Company News & Deals**
-[summary or "None today"]
-"""
-        
+def fetch_articles() -> list[dict]:
+    seen     = load_seen()
+    articles = []
+    cutoff   = datetime.now(timezone.utc) - timedelta(hours=ARTICLE_MAX_AGE_HOURS)
+
+    for feed_url in RSS_FEEDS:
         try:
-            message = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=1000,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-            )
-            
-            response_text = message.content[0].text
-            logger.info("✓ Claude summarization complete")
-            
-            return response_text
-        
+            feed = feedparser.parse(feed_url)
+            feed_name = feed.feed.get("title", feed_url[:50])
+
+            if not feed.entries:
+                log.warning(f"No entries: {feed_url[:60]}")
+                continue
+
+            for entry in feed.entries[:15]:
+                url = entry.get("link", "")
+                uid = hashlib.md5(url.encode()).hexdigest()
+                if uid in seen:
+                    continue
+
+                title   = entry.get("title", "").strip()
+                summary = entry.get("summary", entry.get("description", ""))[:600].strip()
+                text    = (title + " " + summary).lower()
+
+                # Must match at least one LNG keyword
+                if not any(kw.lower() in text for kw in KEYWORDS):
+                    seen.add(uid)
+                    continue
+
+                # Parse & check publish date (timezone-safe)
+                pub_dt = parse_pub_date(entry)
+                if pub_dt:
+                    if pub_dt < cutoff:
+                        seen.add(uid)
+                        continue
+                elif SKIP_UNDATED_ARTICLES:
+                    seen.add(uid)
+                    continue
+
+                articles.append({
+                    "uid":     uid,
+                    "title":   title,
+                    "url":     url,
+                    "summary": summary,
+                    "source":  feed_name,
+                })
+                seen.add(uid)
+
+                if len(articles) >= MAX_ARTICLES_PER_RUN:
+                    break
+
         except Exception as e:
-            logger.error(f"✗ Claude API error: {str(e)}")
-            return ""
+            log.error(f"Feed error ({feed_url[:60]}): {e}")
 
-# ==============================================================================
-# DIGEST FORMATTING
-# ==============================================================================
-class DigestFormatter:
-    """Formats digest for Telegram delivery."""
-    
-    @staticmethod
-    def format_telegram_message(summary, article_count, send_time):
-        """
-        Format digest summary into Telegram HTML message.
-        
-        Args:
-            summary: Claude's categorized summary
-            article_count: Number of articles processed
-            send_time: String timestamp (e.g., "8:00 AM")
-        
-        Returns:
-            str: HTML-formatted Telegram message
-        """
-        # Use SGT for timestamp in message
-        now = datetime.now(SGT).strftime("%Y-%m-%d")
-        
-        header = f"""<b>🚀 LNG Intelligence Briefing</b>
-<i>{now} | {send_time}</i>
+    save_seen(seen)
+    log.info(f"Fetched {len(articles)} new relevant articles")
+    return articles
 
-<b>Articles Today:</b> {article_count}
 
-"""
-        
-        if not summary or summary.strip() == "":
-            body = "<i>No relevant LNG articles found.</i>"
-        else:
-            body = summary
-        
-        footer = f"""
-<i>Updated 3x daily • Singapore Time (SGT, UTC+8)</i>
-<i>Powered by Claude AI • {len(RSS_FEEDS)} feeds</i>"""
-        
-        message = header + body + footer
-        
-        # HTML escape special characters
-        message = (message
-                   .replace("&", "&amp;")
-                   .replace("<", "&lt;")
-                   .replace(">", "&gt;"))
-        
-        # Re-apply intentional HTML tags
-        message = (message
-                   .replace("&lt;b&gt;", "<b>")
-                   .replace("&lt;/b&gt;", "</b>")
-                   .replace("&lt;i&gt;", "<i>")
-                   .replace("&lt;/i&gt;", "</i>"))
-        
-        return message
+# ══════════════════════════════════════════════════════════════════════════════
+#  AI SUMMARY VIA CLAUDE
+# ══════════════════════════════════════════════════════════════════════════════
+def ai_summarise(articles: list[dict]) -> str:
+    """Ask Claude to produce a concise executive briefing from the articles."""
+    if not articles:
+        return "_No significant LNG news in the last 24 hours._"
 
-# ==============================================================================
-# MAIN DIGEST LOGIC
-# ==============================================================================
-class LNGDigest:
-    """Orchestrates the full digest pipeline."""
-    
-    def __init__(self):
-        self.telegram = TelegramService(TELEGRAM_BOT_TOKEN)
-        self.fetcher = ArticleFetcher()
-        self.summarizer = DigestSummarizer(ANTHROPIC_API_KEY)
-        self.formatter = DigestFormatter()
-        self.last_run_times = set()
-    
-    def run_digest(self, send_time_str):
-        """
-        Execute full digest pipeline and send to all recipients.
-        
-        Args:
-            send_time_str: String like "8:00 AM" for header
-        """
-        logger.info("=" * 70)
-        # Use SGT for timestamp in logs
-        logger.info(f"→ Digest run initiated at {datetime.now(SGT)}")
-        logger.info("=" * 70)
-        
-        # Fetch & filter articles
-        articles = self.fetcher.fetch_articles()
-        
-        if not articles:
-            logger.info("⚠ No articles to process; skipping digest")
-            return
-        
-        # Summarize with Claude
-        summary = self.summarizer.summarize_articles(articles)
-        
-        # Format for Telegram
-        message = self.formatter.format_telegram_message(
-            summary,
-            len(articles),
-            send_time_str
+    articles_text = "\n\n".join([
+        f"SOURCE: {a['source']}\n"
+        f"TITLE: {a['title']}\n"
+        f"SUMMARY: {a['summary']}\n"
+        f"URL: {a['url']}"
+        for a in articles[:20]
+    ])
+
+    prompt = f"""You are an expert LNG industry analyst preparing a concise intelligence briefing for a senior professional.
+
+Below are the latest LNG-related news articles. Your task:
+
+1. Group them under these 4 categories (only include a category if there are relevant articles):
+   - 📊 Market Prices & Trade Flows
+   - 🌍 Policy & Geopolitics
+   - 🏗️ Infrastructure & Terminals
+   - 🏢 Company News & Deals
+
+2. For each article write ONE sentence (max 30 words) capturing the key insight — not just the headline.
+3. Add a "🔑 Key Takeaway" at the end: 2-3 sentences on the most strategically important development.
+4. Be direct. Skip filler phrases. Write like a Bloomberg terminal brief.
+5. Include the article URL as a plain link after each item.
+
+Today's articles:
+{articles_text}
+
+Format each item as:
+• [One-sentence insight] ([Source]) — URL
+
+Keep the entire briefing under 600 words."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}],
         )
-        
-        # Send to all recipients
-        logger.info(f"→ Sending to {len(TELEGRAM_RECIPIENTS)} recipient(s)...")
-        results = self.telegram.send_to_all_recipients(message, TELEGRAM_RECIPIENTS)
-        
-        # Log results
-        success_count = sum(1 for v in results.values() if v)
-        logger.info(f"✓ Sent to {success_count}/{len(TELEGRAM_RECIPIENTS)} recipients")
-        logger.info("=" * 70)
-    
-    def should_run(self, target_hour, target_minute):
-        """
-        Check if this is a scheduled run time (prevents duplicates).
-        Uses SGT for timezone-aware scheduling.
-        
-        Args:
-            target_hour: Hour (0-23, SGT)
-            target_minute: Minute (0-59)
-        
-        Returns:
-            bool: True if this run hasn't been done yet today
-        """
-        # ← KEY FIX: Use datetime.now(SGT) instead of datetime.now()
-        now = datetime.now(SGT)
-        today = now.date()
-        current_hour = now.hour
-        current_minute = now.minute
-        
-        # Check if we're within 2 minutes of the scheduled time
-        time_match = (current_hour == target_hour and 
-                     abs(current_minute - target_minute) <= 2)
-        
-        if not time_match:
-            return False
-        
-        # Prevent duplicate runs for the same (hour, minute, date)
-        run_key = (target_hour, target_minute, today)
-        if run_key in self.last_run_times:
-            return False
-        
-        self.last_run_times.add(run_key)
-        logger.info(f"✓ Scheduled run detected: {target_hour}:{target_minute:02d} SGT")
-        return True
-    
-    def start(self):
-        """
-        Start the digest service with continuous polling loop.
-        Runs at 8 AM, 12 PM, and 7 PM SGT daily (timezone-aware).
-        """
-        logger.info("🟢 LNG Digest service started")
-        logger.info(f"   Timezone: {TIMEZONE} (SGT, UTC+8)")
-        logger.info(f"   Recipients: {[name for _, name in TELEGRAM_RECIPIENTS]}")
-        logger.info(f"   Schedule: {', '.join([f'{h}:{m:02d}' for h, m in DAILY_TIMES])} SGT")
-        logger.info(f"   Feeds: {len(RSS_FEEDS)}")
-        logger.info("")
-        
-        while True:
-            try:
-                now = datetime.now(SGT)
-                
-                # Log current time every 5 minutes for debugging
-                if now.minute % 5 == 0:
-                    logger.info(f"⏰ Service running | Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                
-                # Check each scheduled time
-                for target_hour, target_minute in DAILY_TIMES:
-                    if self.should_run(target_hour, target_minute):
-                        send_time_str = f"{target_hour}:{target_minute:02d} SGT"
-                        self.run_digest(send_time_str)
-                
-                # Poll every 30 seconds to catch scheduled times
-                time.sleep(30)
-            
-            except KeyboardInterrupt:
-                logger.info("🛑 Service stopped by user")
-                break
-            except Exception as e:
-                logger.error(f"✗ Unexpected error: {str(e)}")
-                time.sleep(60)  # Brief pause before retry
+        return response.content[0].text.strip()
+    except Exception as e:
+        log.error(f"Claude API error: {e}")
+        # Fallback: simple formatted list
+        return "\n".join([f"• {a['title']} ({a['source']})\n  {a['url']}" for a in articles])
 
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FORMAT TELEGRAM MESSAGE
+# ══════════════════════════════════════════════════════════════════════════════
+def format_message(summary: str, article_count: int, time_label: str = "") -> str:
+    now = datetime.now(SGT)
+    date_str = now.strftime("%A, %d %B %Y")
+    time_str = time_label or now.strftime("%I:%M %p SGT")
+
+    header = (
+        f"🛢️ *LNG Intelligence Briefing*\n"
+        f"📅 {date_str} • {time_str}\n"
+        f"📰 {article_count} articles reviewed\n"
+        f"{'─' * 30}\n\n"
+    )
+
+    footer = (
+        f"\n\n{'─' * 30}\n"
+        f"_Powered by Claude AI • {len(RSS_FEEDS)} sources_\n"
+        f"_Updated 3× daily • Singapore Time (SGT)_"
+    )
+
+    return header + summary + footer
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEND TO TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+def _send_to_chat(chat_id: str, message: str, recipient_name: str = ""):
+    """Send message to a single Telegram chat, splitting if over 4096 char limit."""
+    label = f"{recipient_name} ({chat_id})" if recipient_name else chat_id
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    chunks = [message[i:i + 4000] for i in range(0, len(message), 4000)]
+
+    for i, chunk in enumerate(chunks):
+        payload = {
+            "chat_id":    chat_id,
+            "text":       chunk,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            if resp.status_code == 200:
+                log.info(f"→ {label} chunk {i + 1}/{len(chunks)} sent ✅")
+            else:
+                log.error(f"→ {label} error: {resp.status_code} — {resp.text}")
+                # Retry without Markdown if parsing failed
+                if "can't parse entities" in resp.text.lower():
+                    payload["parse_mode"] = ""
+                    resp2 = requests.post(url, json=payload, timeout=15)
+                    if resp2.status_code == 200:
+                        log.info(f"→ {label} chunk {i + 1} sent (plain text fallback) ✅")
+                    else:
+                        log.error(f"→ {label} plain-text fallback also failed: {resp2.text}")
+        except Exception as e:
+            log.error(f"→ {label} send error: {e}")
+        time.sleep(0.5)
+
+
+def send_telegram(message: str):
+    """Send message to all configured recipients."""
+    if not TELEGRAM_RECIPIENTS:
+        log.error("No recipients configured! Set TELEGRAM_CHAT_ID or TELEGRAM_RECIPIENTS.")
+        return
+
+    log.info(f"Sending to {len(TELEGRAM_RECIPIENTS)} recipient(s)…")
+    success = 0
+    for chat_id, name in TELEGRAM_RECIPIENTS:
+        if not chat_id:
+            log.warning(f"⚠ Skipping {name}: no chat_id configured")
+            continue
+        _send_to_chat(chat_id, message, name)
+        success += 1
+
+    log.info(f"✓ Sent to {success}/{len(TELEGRAM_RECIPIENTS)} recipients")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN DIGEST JOB
+# ══════════════════════════════════════════════════════════════════════════════
+def run_digest(time_label: str = ""):
+    log.info("═══ Running LNG Digest ═══")
+    articles = fetch_articles()
+
+    if not articles:
+        message = (
+            f"🛢️ *LNG Intelligence Briefing*\n"
+            f"📅 {datetime.now(SGT).strftime('%A, %d %B %Y')}\n\n"
+            f"_No significant new LNG developments since last update._"
+        )
+        send_telegram(message)
+        log.info("No articles — short message sent")
+        return
+
+    # Save to history for weekly/monthly summaries
+    save_to_history(articles)
+
+    log.info(f"Generating AI summary for {len(articles)} articles…")
+    summary = ai_summarise(articles)
+    message = format_message(summary, len(articles), time_label)
+    send_telegram(message)
+    log.info("Digest complete ✅")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FEED DIAGNOSTICS (--diagnose flag)
+# ══════════════════════════════════════════════════════════════════════════════
+def run_diagnostics():
+    """Test all feeds and report which ones are returning articles."""
+    print("=" * 70)
+    print("FEED DIAGNOSTICS")
+    print(f"Testing {len(RSS_FEEDS)} feeds")
+    print(f"Article max age: {ARTICLE_MAX_AGE_HOURS} hours")
+    print(f"Skip undated: {SKIP_UNDATED_ARTICLES}")
+    print("=" * 70)
+
+    total_entries = 0
+    total_matched = 0
+    working_feeds = 0
+
+    for feed_url in RSS_FEEDS:
+        print(f"\n→ {feed_url[:70]}")
+        try:
+            feed = feedparser.parse(feed_url)
+            entries = feed.entries
+            if not entries:
+                print("   ✗ No entries")
+                continue
+
+            working_feeds += 1
+            matched = 0
+            for entry in entries[:10]:
+                total_entries += 1
+                title   = entry.get("title", "")
+                summary = entry.get("summary", "")[:300]
+                text    = (title + " " + summary).lower()
+
+                if any(kw.lower() in text for kw in KEYWORDS):
+                    matched += 1
+                    total_matched += 1
+
+                # Test date parsing
+                pub_dt = parse_pub_date(entry)
+                date_status = pub_dt.strftime("%Y-%m-%d %H:%M UTC") if pub_dt else "no date"
+                if matched <= 2 and any(kw.lower() in text for kw in KEYWORDS):
+                    print(f"   ✓ [{date_status}] {title[:60]}")
+
+            print(f"   {len(entries)} entries, {matched} LNG matches")
+
+        except Exception as e:
+            print(f"   ✗ Error: {e}")
+
+    print("\n" + "=" * 70)
+    print(f"Working feeds:  {working_feeds}/{len(RSS_FEEDS)}")
+    print(f"Total entries:  {total_entries}")
+    print(f"LNG matches:    {total_matched}")
+    print("=" * 70)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCHEDULER — polling loop for Railway (no cron needed)
+# ══════════════════════════════════════════════════════════════════════════════
+def start_scheduler():
+    """Continuous polling loop. Checks scheduled times in SGT."""
+    last_run_times = set()
+
+    log.info("🟢 LNG Digest service started")
+    log.info(f"   Timezone: SGT (UTC+8)")
+    log.info(f"   Schedule: {', '.join(f'{h}:{m:02d}' for h, m in DAILY_TIMES)} SGT")
+    log.info(f"   Feeds: {len(RSS_FEEDS)}")
+    log.info(f"   Recipients: {[name for _, name in TELEGRAM_RECIPIENTS]}")
+    log.info("")
+
+    while True:
+        try:
+            now = datetime.now(SGT)
+
+            for target_hour, target_minute in DAILY_TIMES:
+                time_match = (
+                    now.hour == target_hour
+                    and abs(now.minute - target_minute) <= 2
+                )
+                run_key = (target_hour, target_minute, now.date())
+
+                if time_match and run_key not in last_run_times:
+                    last_run_times.add(run_key)
+                    time_label = f"{target_hour}:{target_minute:02d} SGT"
+                    log.info(f"⏰ Scheduled run: {time_label}")
+                    run_digest(time_label)
+
+            # Clean old run keys (keep only today)
+            today = now.date()
+            last_run_times = {k for k in last_run_times if k[2] == today}
+
+            time.sleep(30)
+
+        except KeyboardInterrupt:
+            log.info("🛑 Service stopped by user")
+            break
+        except Exception as e:
+            log.error(f"Unexpected error in scheduler: {e}", exc_info=True)
+            time.sleep(60)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    digest = LNGDigest()
-    digest.start()
+    parser = argparse.ArgumentParser(description="LNG Intelligence Pipeline")
+    parser.add_argument("--test", action="store_true", help="Send one digest now and exit")
+    parser.add_argument("--diagnose", action="store_true", help="Test all feeds and exit")
+    args = parser.parse_args()
+
+    if args.diagnose:
+        run_diagnostics()
+    elif args.test:
+        log.info("Running test digest…")
+        run_digest("Test Run")
+    else:
+        start_scheduler()
