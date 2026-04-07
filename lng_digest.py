@@ -157,16 +157,24 @@ CATEGORIES = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LOGGING
-# ══════════════════════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")),
-    ],
-)
+#  LOGGING (timestamps in SGT to match Railway dashboard)
+# ═══...
+class SGTFormatter(logging.Formatter):
+    """Forces log timestamps to SGT (UTC+8) regardless of server timezone."""
+    def formatTime(self, record, datefmt=None):
+        utc_dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        sgt_dt = utc_dt.astimezone(SGT)
+        if datefmt:
+            return sgt_dt.strftime(datefmt)
+        return sgt_dt.strftime("%Y-%m-%d %H:%M:%S SGT")
+
+_fmt = SGTFormatter("%(asctime)s [%(levelname)s] %(message)s")
+_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_file_handler.setFormatter(_fmt)
+_stream_handler = logging.StreamHandler(stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
+_stream_handler.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
 log = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════
