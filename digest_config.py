@@ -28,7 +28,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Three daily digest sends in Singapore Time (SGT, UTC+8)
 DAILY_TIMES = [
     (8, 0),    # 8:00 AM SGT
-    (12, 0),   # 12:00 PM SGT
+    (2, 0),   # 12:00 PM SGT
     (19, 0),   # 7:00 PM SGT
 ]
 
