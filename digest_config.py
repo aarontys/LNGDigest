@@ -22,7 +22,8 @@ TIMEZONE = "Asia/Singapore"
 # IMPORTANT: Keep these secure; prefer environment variables in production
 
 TELEGRAM_RECIPIENTS = [
-    (os.getenv("TELEGRAM_CHAT_ID"), "You"),  # Primary recipient
+    (os.getenv("TELEGRAM_CHAT_ID"), "Aaron"),  # Primary recipient
+    (os.getenv("COLLEAGUE_TELEGRAM_CHAT_ID"), "Jennifer"),
     # Uncomment and add colleague details when ready:
     # (os.getenv("COLLEAGUE_TELEGRAM_CHAT_ID"), "Colleague Name"),
 ]
