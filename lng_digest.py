@@ -72,7 +72,7 @@ if not TELEGRAM_RECIPIENTS:
 SGT = timezone(timedelta(hours=8))
 
 # --- Schedule: (hour, minute) tuples in SGT ---
-DAILY_TIMES = [(8, 0), (12, 0), (21, 25)]
+DAILY_TIMES = [(8, 0), (12, 0), (19, 0)]
 
 # --- Files ---
 SEEN_FILE = "seen_articles.json"
@@ -158,7 +158,7 @@ CATEGORIES = {
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING (timestamps in SGT to match Railway dashboard)
-# ═══...
+# ══════════════════════════════════════════════════════════════════════════════
 class SGTFormatter(logging.Formatter):
     """Forces log timestamps to SGT (UTC+8) regardless of server timezone."""
     def formatTime(self, record, datefmt=None):
@@ -321,28 +321,31 @@ def ai_summarise(articles: list[dict]) -> str:
         for a in articles[:20]
     ])
 
-    prompt = f"""You are an expert LNG industry analyst preparing a concise intelligence briefing for a senior professional.
+    prompt = f"""You are an elite LNG industry analyst at a top-tier commodities research house. You are preparing a concise morning intelligence briefing for a C-suite executive. Your writing style: Bloomberg terminal, Wood Mackenzie, S&P Global Platts. No filler. Every word earns its place.
 
-Below are the latest LNG-related news articles. Your task:
+STRICT RULES:
+- Group articles under ONLY these category headers (skip any category with zero articles):
 
-1. Group them under these 4 categories (only include a category if there are relevant articles):
-   - 📊 Market Prices & Trade Flows
-   - 🌍 Policy & Geopolitics
-   - 🏗️ Infrastructure & Terminals
-   - 🏢 Company News & Deals
+📊 Market Prices & Trade Flows
+🌍 Policy & Geopolitics
+🏗️ Infrastructure & Terminals
+🏢 Company News & Deals
 
-2. For each article write ONE sentence (max 30 words) capturing the key insight — not just the headline.
-3. Add a "🔑 Key Takeaway" at the end: 2-3 sentences on the most strategically important development.
-4. Be direct. Skip filler phrases. Write like a Bloomberg terminal brief.
-5. Include the article URL as a plain link after each item.
+- Under each header, list each article as a single bullet using EXACTLY this format:
+  • [One sentence, max 25 words, stating the strategic insight — NOT the headline reworded] ([Source Name]) — URL
+
+- After all categories, add:
+  🔑 Key Takeaway
+  [2-3 sentences identifying the single most strategically significant development and why it matters for LNG markets]
+
+WRITING STYLE:
+- Bloomberg brevity. No adjectives unless they carry data ("record-high" yes, "significant" no).
+- Lead each bullet with the actor or subject, not "According to..."
+- Quantify where possible: prices, volumes, percentages, timelines.
+- No preamble, no sign-off, no "Here is your briefing" — start directly with the first category header.
 
 Today's articles:
-{articles_text}
-
-Format each item as:
-• [One-sentence insight] ([Source]) — URL
-
-Keep the entire briefing under 600 words."""
+{articles_text}"""
 
     try:
         response = client.messages.create(
