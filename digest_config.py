@@ -37,6 +37,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DAILY_TIMES = [
     (8, 0),    # 8:00 AM SGT
     (12, 0),   # 12:00 PM SGT
+    (14, 35),  # 2:35 PM SGT
     (19, 0),   # 7:00 PM SGT
 ]
 
