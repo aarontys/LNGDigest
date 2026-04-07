@@ -72,7 +72,7 @@ if not TELEGRAM_RECIPIENTS:
 SGT = timezone(timedelta(hours=8))
 
 # --- Schedule: (hour, minute) tuples in SGT ---
-DAILY_TIMES = [(8, 0), (12, 0), (19, 0)]
+DAILY_TIMES = [(8, 0), (12, 0), (21, 25)]
 
 # --- Files ---
 SEEN_FILE = "seen_articles.json"
