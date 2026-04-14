@@ -7,62 +7,61 @@ and delivers formatted briefings to Telegram.
 
 Deployment: Railway.app (GitHub-connected, always-on Python service)
 Timezone:   Singapore (SGT, UTC+8)
-Schedule:   8:00 AM, 12:00 PM, 7:00 PM SGT
+Schedule:   Configurable in digest_config.py
 
-Setup:
-  pip install feedparser requests anthropic
-
-Run locally:
-  python lng_digest.py              # starts polling loop
-  python lng_digest.py --test       # sends one digest immediately, then exits
-  python lng_digest.py --diagnose   # tests all feeds and prints diagnostics
+Usage:
+  python lng_digest.py              # start polling loop (production)
+  python lng_digest.py --test       # send one digest immediately, then exit
+  python lng_digest.py --diagnose   # test all feeds and print diagnostics
 """
 
 import os
 import sys
 import io
+import re
 import json
+import base64
 import hashlib
 import logging
 import time
 import argparse
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, parse_qs
 
 import feedparser
 import requests
 import anthropic
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION (env vars for Railway, fallback to digest_config.py)
+#  CONFIGURATION — loaded from digest_config.py, with safe defaults
 # ══════════════════════════════════════════════════════════════════════════════
 
-# --- Credentials (env vars take priority, digest_config.py as fallback) ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# Multi-recipient support: list of (chat_id, display_name) tuples
-# Built from env vars — add COLLEAGUE_TELEGRAM_CHAT_ID, COLLEAGUE_2_TELEGRAM_CHAT_ID etc.
-TELEGRAM_RECIPIENTS = None  # Will be populated below
-
-# Fall back to digest_config.py if env vars are empty
+_has_config = False
 try:
     import digest_config as _cfg
-    TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or getattr(_cfg, "TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID   = TELEGRAM_CHAT_ID or getattr(_cfg, "TELEGRAM_CHAT_ID", "")
-    ANTHROPIC_API_KEY   = ANTHROPIC_API_KEY or getattr(_cfg, "ANTHROPIC_API_KEY", "")
-    # If digest_config defines TELEGRAM_RECIPIENTS, use it directly
-    TELEGRAM_RECIPIENTS = getattr(_cfg, "TELEGRAM_RECIPIENTS", None)
+    _has_config = True
 except ImportError:
     pass
 
-# Build recipients list if not already set by digest_config
+
+def _conf(name, default=None):
+    """Read a setting from digest_config.py, falling back to default."""
+    if _has_config:
+        return getattr(_cfg, name, default)
+    return default
+
+
+# --- Credentials (env vars take priority) ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "") or _conf("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "") or _conf("ANTHROPIC_API_KEY", "")
+
+# --- Recipients ---
+TELEGRAM_RECIPIENTS = _conf("TELEGRAM_RECIPIENTS", None)
 if not TELEGRAM_RECIPIENTS:
     TELEGRAM_RECIPIENTS = []
-    # Primary recipient (you)
     if TELEGRAM_CHAT_ID:
         TELEGRAM_RECIPIENTS.append((TELEGRAM_CHAT_ID, "Primary"))
-    # Additional recipients from env vars (COLLEAGUE_TELEGRAM_CHAT_ID, COLLEAGUE_2_...)
     for key, val in os.environ.items():
         if key.endswith("_TELEGRAM_CHAT_ID") and key != "TELEGRAM_CHAT_ID":
             name = key.replace("_TELEGRAM_CHAT_ID", "").replace("_", " ").title()
@@ -71,90 +70,32 @@ if not TELEGRAM_RECIPIENTS:
 # --- Timezone ---
 SGT = timezone(timedelta(hours=8))
 
-# --- Schedule: (hour, minute) tuples in SGT ---
-DAILY_TIMES = [(8, 0), (12, 0), (22, 0)]
+# --- Schedule ---
+DAILY_TIMES = _conf("DAILY_TIMES", [(8, 0), (12, 0), (15, 0), (21, 25)])
 
 # --- Files ---
-SEEN_FILE = "seen_articles.json"
+SEEN_FILE    = "seen_articles.json"
 HISTORY_FILE = "article_history.json"
-LOG_FILE  = "lng_digest.log"
+LOG_FILE     = "lng_digest.log"
 
 # --- Limits ---
-MAX_ARTICLES_PER_RUN   = 30
-ARTICLE_MAX_AGE_HOURS  = 48
-SKIP_UNDATED_ARTICLES  = True
+MAX_ARTICLES_PER_RUN  = _conf("MAX_ARTICLES_PER_RUN", 30)
+ARTICLE_MAX_AGE_HOURS = _conf("ARTICLE_MAX_AGE_HOURS", 48)
+SKIP_UNDATED_ARTICLES = _conf("SKIP_UNDATED_ARTICLES", True)
 
 # --- Claude ---
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = _conf("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  RSS FEEDS — verified, working sources (Apr 2025)
-# ══════════════════════════════════════════════════════════════════════════════
-RSS_FEEDS = [
-    # --- Major Wire Services & News ---
-    "https://news.google.com/rss/search?q=LNG+liquefied+natural+gas&hl=en&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=LNG+terminal+OR+LNG+cargo+OR+LNG+shipment&hl=en&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=natural+gas+price+spot+market&hl=en&gl=US&ceid=US:en",
+# --- Feeds, keywords, categories ---
+RSS_FEEDS  = _conf("RSS_FEEDS", [])
+KEYWORDS   = _conf("KEYWORDS", [])
+CATEGORIES = _conf("CATEGORIES", {})
 
-    # --- Energy-Specific Sources ---
-    "https://oilprice.com/rss/main",
-    "https://www.rigzone.com/news/rss/rigzone_latest.aspx",
-    "https://www.offshore-energy.biz/feed/",
-    "https://www.upstreamonline.com/rss",
-    "https://www.spglobal.com/commodityinsights/en/rss-feed/natural-gas",
-    "https://www.naturalgasintel.com/feed/",
-    "https://www.hellenicshippingnews.com/category/lng/feed/",
-    "https://splash247.com/feed/",
+if not RSS_FEEDS:
+    sys.exit("ERROR: No RSS_FEEDS configured. Check digest_config.py.")
+if not KEYWORDS:
+    sys.exit("ERROR: No KEYWORDS configured. Check digest_config.py.")
 
-    # --- General Energy & Geopolitics ---
-    "https://www.aljazeera.com/xml/rss/all.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Energy.xml",
-
-    # --- Industry Bodies ---
-    "https://www.eia.gov/rss/todayinenergy.xml",
-]
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  KEYWORDS — terms that indicate LNG relevance
-# ══════════════════════════════════════════════════════════════════════════════
-KEYWORDS = [
-    "lng", "liquefied natural gas", "natural gas",
-    "henry hub", "ttf", "jkm", "nbp",
-    "regasification", "liquefaction", "fsru", "flng",
-    "gas terminal", "gas pipeline", "gas export", "gas import",
-    "gas cargo", "gas shipment", "gas tanker",
-    "gas price", "gas spot", "gas market", "gas trade",
-    "gas supply", "gas demand",
-    "cheniere", "venture global", "sempra", "tellurian", "driftwood",
-    "qatar energy", "qatargas", "novatek", "yamal", "arctic lng",
-    "santos", "woodside", "petronas lng", "shell lng", "totalenergies lng",
-    "bp lng", "equinor lng", "eni lng", "chevron lng", "conocophillips lng",
-    "sabine pass", "freeport lng", "cameron lng", "corpus christi",
-    "golden pass", "port arthur lng", "plaquemines",
-    "energy security", "gas sanctions", "energy transition",
-]
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CATEGORIES — for AI-driven grouping
-# ══════════════════════════════════════════════════════════════════════════════
-CATEGORIES = {
-    "📊 Market Prices & Trade Flows": [
-        "price", "spot", "cargo", "trade", "export", "import",
-        "shipment", "tanker", "supply", "demand", "henry hub", "ttf", "jkm",
-    ],
-    "🌍 Policy & Geopolitics": [
-        "policy", "sanction", "government", "geopolit", "treaty",
-        "regulation", "minister", "summit", "war", "conflict", "election",
-    ],
-    "🏗️ Infrastructure & Terminals": [
-        "terminal", "regasification", "liquefaction", "fsru", "pipeline",
-        "port", "construction", "capacity", "infrastructure", "project", "plant",
-    ],
-    "🏢 Company News & Deals": [
-        "deal", "acquisition", "merger", "contract", "agreement",
-        "partnership", "investment", "company", "corp", "ipo", "quarterly", "earnings",
-    ],
-}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING (timestamps in SGT to match Railway dashboard)
@@ -194,7 +135,6 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set):
-    # Keep only last 5000 hashes to prevent file bloat
     trimmed = list(seen)[-5000:]
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f)
@@ -232,6 +172,108 @@ def save_to_history(articles: list[dict]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  GOOGLE NEWS URL RESOLVER
+# ══════════════════════════════════════════════════════════════════════════════
+def _extract_url_from_entry(entry) -> str | None:
+    """Try to extract the real article URL from RSS entry metadata.
+
+    Google News RSS entries often embed the source URL in:
+    1. The <source url="..."> element (feedparser exposes as source.href)
+    2. An <a href="..."> inside the description/summary HTML
+    """
+    # Strategy 1: source element
+    source = entry.get("source", {})
+    if isinstance(source, dict):
+        href = source.get("href", "")
+        if href and "news.google.com" not in href:
+            return href
+
+    # Strategy 2: first <a href> in description HTML
+    desc = entry.get("summary", entry.get("description", ""))
+    match = re.search(r'<a[^>]+href="(https?://[^"]+)"', desc)
+    if match:
+        candidate = match.group(1)
+        if "news.google.com" not in candidate:
+            return candidate
+
+    return None
+
+
+def _decode_google_news_url(url: str) -> str | None:
+    """Decode the Base64 payload in a Google News CBMi... URL.
+
+    Google News encodes the real URL in a base64url blob after /articles/.
+    The blob starts with 'CBMi' and contains the article URL as a
+    length-prefixed string inside a protobuf-like structure.
+    """
+    # Extract the base64 segment from the URL path
+    match = re.search(r"/articles/([A-Za-z0-9_-]+)", url)
+    if not match:
+        return None
+
+    encoded = match.group(1)
+    # Add padding if needed
+    padding = 4 - len(encoded) % 4
+    if padding != 4:
+        encoded += "=" * padding
+
+    try:
+        raw = base64.urlsafe_b64decode(encoded)
+    except Exception:
+        return None
+
+    # The decoded bytes contain the URL as a string.
+    # Extract all plausible URLs from the raw bytes.
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        text = raw.decode("latin-1", errors="ignore")
+
+    urls = re.findall(r"https?://[^\s\x00-\x1f\"'<>]+", text)
+    for candidate in urls:
+        if "news.google.com" not in candidate and "google.com" not in candidate:
+            return candidate.rstrip(".,;)")
+
+    return None
+
+
+def resolve_google_news_url(url: str, entry=None) -> str:
+    """Resolve a Google News redirect URL to the actual article URL.
+
+    Uses multiple strategies in order of speed/reliability:
+    1. Extract from RSS entry metadata (no network call)
+    2. Decode from Base64 payload in URL (no network call)
+    3. Follow HTTP redirects (slow, often fails due to JS redirect)
+    Falls back to the original URL if all strategies fail.
+    """
+    if "news.google.com" not in url:
+        return url
+
+    # Strategy 1: RSS entry metadata
+    if entry:
+        result = _extract_url_from_entry(entry)
+        if result:
+            return result
+
+    # Strategy 2: Base64 decode
+    result = _decode_google_news_url(url)
+    if result:
+        return result
+
+    # Strategy 3: HTTP redirect (last resort, often blocked by JS)
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=8,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        if "news.google.com" not in resp.url:
+            return resp.url
+    except Exception:
+        pass
+
+    log.warning(f"Could not resolve Google News URL: {url[:80]}")
+    return url
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FETCH & FILTER ARTICLES
 # ══════════════════════════════════════════════════════════════════════════════
 def parse_pub_date(entry) -> datetime | None:
@@ -240,7 +282,6 @@ def parse_pub_date(entry) -> datetime | None:
     if not published:
         return None
     try:
-        # published_parsed is a time.struct_time; treat as UTC
         return datetime(*published[:6], tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
@@ -261,8 +302,8 @@ def fetch_articles() -> list[dict]:
                 continue
 
             for entry in feed.entries[:15]:
-                url = entry.get("link", "")
-                uid = hashlib.md5(url.encode()).hexdigest()
+                raw_url = entry.get("link", "")
+                uid = hashlib.md5(raw_url.encode()).hexdigest()
                 if uid in seen:
                     continue
 
@@ -270,12 +311,10 @@ def fetch_articles() -> list[dict]:
                 summary = entry.get("summary", entry.get("description", ""))[:600].strip()
                 text    = (title + " " + summary).lower()
 
-                # Must match at least one LNG keyword
                 if not any(kw.lower() in text for kw in KEYWORDS):
                     seen.add(uid)
                     continue
 
-                # Parse & check publish date (timezone-safe)
                 pub_dt = parse_pub_date(entry)
                 if pub_dt:
                     if pub_dt < cutoff:
@@ -284,6 +323,9 @@ def fetch_articles() -> list[dict]:
                 elif SKIP_UNDATED_ARTICLES:
                     seen.add(uid)
                     continue
+
+                # Resolve Google News redirect URLs to actual article URLs
+                url = resolve_google_news_url(raw_url, entry=entry)
 
                 articles.append({
                     "uid":     uid,
@@ -321,15 +363,20 @@ def ai_summarise(articles: list[dict]) -> str:
         for a in articles[:20]
     ])
 
+    # Build category list from config
+    cat_list = "\n".join(CATEGORIES.keys()) if CATEGORIES else (
+        "📊 Market Prices & Trade Flows\n"
+        "🌍 Policy & Geopolitics\n"
+        "🏗️ Infrastructure & Terminals\n"
+        "🏢 Company News & Deals"
+    )
+
     prompt = f"""You are an elite LNG industry analyst at a top-tier commodities research house. You are preparing a concise morning intelligence briefing for a C-suite executive. Your writing style: Bloomberg terminal, Wood Mackenzie, S&P Global Platts. No filler. Every word earns its place.
 
 STRICT RULES:
 - Group articles under ONLY these category headers (skip any category with zero articles):
 
-📊 Market Prices & Trade Flows
-🌍 Policy & Geopolitics
-🏗️ Infrastructure & Terminals
-🏢 Company News & Deals
+{cat_list}
 
 - Under each header, list each article as a single bullet using EXACTLY this format:
   • [One sentence, max 25 words, stating the strategic insight — NOT the headline reworded] ([Source Name]) — URL
@@ -356,7 +403,6 @@ Today's articles:
         return response.content[0].text.strip()
     except Exception as e:
         log.error(f"Claude API error: {e}")
-        # Fallback: simple formatted list
         return "\n".join([f"• {a['title']} ({a['source']})\n  {a['url']}" for a in articles])
 
 
@@ -378,7 +424,7 @@ def format_message(summary: str, article_count: int, time_label: str = "") -> st
     footer = (
         f"\n\n{'─' * 30}\n"
         f"_Powered by Claude AI • {len(RSS_FEEDS)} sources_\n"
-        f"_Updated 3× daily • Singapore Time (SGT)_"
+        f"_Updated {len(DAILY_TIMES)}× daily • Singapore Time (SGT)_"
     )
 
     return header + summary + footer
@@ -406,7 +452,6 @@ def _send_to_chat(chat_id: str, message: str, recipient_name: str = ""):
                 log.info(f"→ {label} chunk {i + 1}/{len(chunks)} sent ✅")
             else:
                 log.error(f"→ {label} error: {resp.status_code} — {resp.text}")
-                # Retry without Markdown if parsing failed
                 if "can't parse entities" in resp.text.lower():
                     payload["parse_mode"] = ""
                     resp2 = requests.post(url, json=payload, timeout=15)
@@ -419,22 +464,23 @@ def _send_to_chat(chat_id: str, message: str, recipient_name: str = ""):
         time.sleep(0.5)
 
 
-def send_telegram(message: str):
-    """Send message to all configured recipients."""
-    if not TELEGRAM_RECIPIENTS:
+def send_telegram(message: str, recipients: list = None):
+    """Send message to specified recipients (defaults to TELEGRAM_RECIPIENTS)."""
+    targets = recipients or TELEGRAM_RECIPIENTS
+    if not targets:
         log.error("No recipients configured! Set TELEGRAM_CHAT_ID or TELEGRAM_RECIPIENTS.")
         return
 
-    log.info(f"Sending to {len(TELEGRAM_RECIPIENTS)} recipient(s)…")
+    log.info(f"Sending to {len(targets)} recipient(s)…")
     success = 0
-    for chat_id, name in TELEGRAM_RECIPIENTS:
+    for chat_id, name in targets:
         if not chat_id:
             log.warning(f"⚠ Skipping {name}: no chat_id configured")
             continue
         _send_to_chat(chat_id, message, name)
         success += 1
 
-    log.info(f"✓ Sent to {success}/{len(TELEGRAM_RECIPIENTS)} recipients")
+    log.info(f"✓ Sent to {success}/{len(targets)} recipients")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,7 +500,6 @@ def run_digest(time_label: str = ""):
         log.info("No articles — short message sent")
         return
 
-    # Save to history for weekly/monthly summaries
     save_to_history(articles)
 
     log.info(f"Generating AI summary for {len(articles)} articles…")
@@ -501,7 +546,6 @@ def run_diagnostics():
                     matched += 1
                     total_matched += 1
 
-                # Test date parsing
                 pub_dt = parse_pub_date(entry)
                 date_status = pub_dt.strftime("%Y-%m-%d %H:%M UTC") if pub_dt else "no date"
                 if matched <= 2 and any(kw.lower() in text for kw in KEYWORDS):
@@ -524,11 +568,22 @@ def run_diagnostics():
 # ══════════════════════════════════════════════════════════════════════════════
 def start_scheduler():
     """Continuous polling loop. Checks scheduled times in SGT."""
+    # Import job scraper if available
+    job_runner = None
+    try:
+        from lng_jobs import run_job_check
+        JOB_TIMES = _conf("JOB_TIMES", [])
+        if JOB_TIMES:
+            job_runner = (run_job_check, JOB_TIMES)
+            log.info(f"   Job scraper: {', '.join(f'{h}:{m:02d}' for h, m in JOB_TIMES)} SGT")
+    except ImportError:
+        pass
+
     last_run_times = set()
 
     log.info("🟢 LNG Digest service started")
     log.info(f"   Timezone: SGT (UTC+8)")
-    log.info(f"   Schedule: {', '.join(f'{h}:{m:02d}' for h, m in DAILY_TIMES)} SGT")
+    log.info(f"   News schedule: {', '.join(f'{h}:{m:02d}' for h, m in DAILY_TIMES)} SGT")
     log.info(f"   Feeds: {len(RSS_FEEDS)}")
     log.info(f"   Recipients: {[name for _, name in TELEGRAM_RECIPIENTS]}")
     log.info("")
@@ -537,22 +592,39 @@ def start_scheduler():
         try:
             now = datetime.now(SGT)
 
+            # --- News digest schedule ---
             for target_hour, target_minute in DAILY_TIMES:
                 time_match = (
                     now.hour == target_hour
                     and abs(now.minute - target_minute) <= 2
                 )
-                run_key = (target_hour, target_minute, now.date())
+                run_key = ("news", target_hour, target_minute, now.date())
 
                 if time_match and run_key not in last_run_times:
                     last_run_times.add(run_key)
                     time_label = f"{target_hour}:{target_minute:02d} SGT"
-                    log.info(f"⏰ Scheduled run: {time_label}")
+                    log.info(f"⏰ Scheduled news digest: {time_label}")
                     run_digest(time_label)
+
+            # --- Job scraper schedule ---
+            if job_runner:
+                job_func, job_times = job_runner
+                for target_hour, target_minute in job_times:
+                    time_match = (
+                        now.hour == target_hour
+                        and abs(now.minute - target_minute) <= 2
+                    )
+                    run_key = ("jobs", target_hour, target_minute, now.date())
+
+                    if time_match and run_key not in last_run_times:
+                        last_run_times.add(run_key)
+                        time_label = f"{target_hour}:{target_minute:02d} SGT"
+                        log.info(f"⏰ Scheduled job check: {time_label}")
+                        job_func()
 
             # Clean old run keys (keep only today)
             today = now.date()
-            last_run_times = {k for k in last_run_times if k[2] == today}
+            last_run_times = {k for k in last_run_times if k[-1] == today}
 
             time.sleep(30)
 
@@ -571,6 +643,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LNG Intelligence Pipeline")
     parser.add_argument("--test", action="store_true", help="Send one digest now and exit")
     parser.add_argument("--diagnose", action="store_true", help="Test all feeds and exit")
+    parser.add_argument("--test-jobs", action="store_true", help="Run one job check and exit")
     args = parser.parse_args()
 
     if args.diagnose:
@@ -578,5 +651,9 @@ if __name__ == "__main__":
     elif args.test:
         log.info("Running test digest…")
         run_digest("Test Run")
+    elif args.test_jobs:
+        from lng_jobs import run_job_check
+        log.info("Running test job check…")
+        run_job_check()
     else:
         start_scheduler()
