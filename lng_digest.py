@@ -177,23 +177,17 @@ def save_to_history(articles: list[dict]):
 def _extract_url_from_entry(entry) -> str | None:
     """Try to extract the real article URL from RSS entry metadata.
 
-    Google News RSS entries often embed the source URL in:
-    1. The <source url="..."> element (feedparser exposes as source.href)
-    2. An <a href="..."> inside the description/summary HTML
+    Google News RSS entries embed the article URL as an <a href="...">
+    inside the description/summary HTML. Note: the <source url="...">
+    element contains the publisher's homepage (e.g. https://bloomberg.com),
+    NOT the article URL, so we skip it.
     """
-    # Strategy 1: source element
-    source = entry.get("source", {})
-    if isinstance(source, dict):
-        href = source.get("href", "")
-        if href and "news.google.com" not in href:
-            return href
-
-    # Strategy 2: first <a href> in description HTML
     desc = entry.get("summary", entry.get("description", ""))
-    match = re.search(r'<a[^>]+href="(https?://[^"]+)"', desc)
-    if match:
-        candidate = match.group(1)
-        if "news.google.com" not in candidate:
+    # Look for the last <a href> — Google News descriptions typically have
+    # the article link as the last anchor tag
+    matches = re.findall(r'<a[^>]+href="(https?://[^"]+)"', desc)
+    for candidate in reversed(matches):
+        if "news.google.com" not in candidate and "support.google.com" not in candidate:
             return candidate
 
     return None

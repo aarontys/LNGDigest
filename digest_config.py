@@ -121,9 +121,10 @@ JOB_TIMES = [
 ]
 
 # ── Job feeds ─────────────────────────────────────────────────────────────────
-# LinkedIn doesn't offer RSS; use saved search email alerts separately.
-# Workday career portals (Shell, BP, etc.) don't offer RSS either —
-# Google News search feeds below act as a catch-all for those.
+# LinkedIn and Workday career portals don't offer RSS.
+# Google News returns news articles, not job postings — don't use it here.
+# For company-specific coverage, create Google Alerts (deliver to RSS feed)
+# and paste the URLs into the GOOGLE_ALERTS section below.
 JOB_FEEDS = [
     # --- Indeed RSS (keyword + location combos) ---
     # Singapore
@@ -145,52 +146,36 @@ JOB_FEEDS = [
     "https://www.energyjobline.com/rss/all",
     "https://www.rigzone.com/jobs/rss/rigzone_jobs.aspx",
 
-    # --- Google News catch-all for IOC/major career postings ---
-    # These pick up career page listings indexed by Google, covering
-    # companies that don't syndicate to Indeed (Workday portals etc.)
-    "https://news.google.com/rss/search?q=Shell+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=BP+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=TotalEnergies+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Chevron+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=ExxonMobil+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Equinor+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=ConocoPhillips+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Woodside+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=JERA+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Trafigura+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Vitol+LNG+OR+gas+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Gunvor+LNG+OR+gas+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Cheniere+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Venture+Global+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Santos+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Petronas+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Sempra+LNG+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Pavilion+Energy+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=Sembcorp+LNG+OR+gas+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-
-    # --- Broader LNG job searches via Google News ---
-    "https://news.google.com/rss/search?q=LNG+trading+jobs+OR+careers+OR+hiring&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=LNG+origination+OR+structuring+jobs+OR+careers&hl=en&gl=SG&ceid=SG:en",
-    "https://news.google.com/rss/search?q=gas+trading+analyst+OR+portfolio+jobs+OR+careers&hl=en&gl=SG&ceid=SG:en",
+    # --- Google Alerts RSS (general web search, not news) ---
+    # To add: go to google.com/alerts → create alert → set "Deliver to: RSS"
+    # → copy the feed URL and paste here. Covers career pages Google indexes.
+    # Example: "Shell LNG careers" alert would catch shell.wd3.myworkdayjobs.com
+    # postings when Google indexes them.
+    #
+    # "https://www.google.com/alerts/feeds/YOUR_ALERT_ID_1/YOUR_FEED_ID_1",
+    # "https://www.google.com/alerts/feeds/YOUR_ALERT_ID_2/YOUR_FEED_ID_2",
 ]
 
 # ── Job keywords — at least one must match title or description ───────────────
+# NOTE: These must be job-posting-specific terms, not general industry terms.
+# "LNG" alone would match news articles. Use "LNG" + job-signal terms.
 JOB_KEYWORDS = [
-    # Core LNG roles
-    "lng", "liquefied natural gas",
-    # Commercial & trading
+    # Job-specific LNG terms
+    "lng job", "lng career", "lng hiring", "lng vacancy", "lng role",
+    "lng analyst", "lng trader", "lng commercial", "lng manager",
+    "lng engineer", "lng operator", "lng specialist",
+    # Commercial & trading roles
     "gas trading", "energy trading", "commodity trading",
-    "origination", "structuring", "portfolio",
+    "origination", "structuring", "portfolio manager",
     "commercial analyst", "commercial manager",
-    # Quantitative & analytics
-    "quant", "quantitative", "pricing analyst", "risk analyst",
-    "valuation", "modelling", "optimization",
-    # Specific companies (your target list)
-    "jera", "shell", "bp", "totalenergies", "trafigura", "vitol",
-    "gunvor", "pavilion energy", "sembcorp", "woodside", "cheniere",
-    "venture global", "santos",
-    # Specialist recruiters often tag roles with these
+    # Quantitative & analytics roles
+    "quant analyst", "quantitative analyst", "pricing analyst", "risk analyst",
+    "valuation analyst", "modelling analyst", "optimization",
+    # Role-type terms (these are specific enough to avoid news matches)
     "energy analyst", "gas analyst", "commodity analyst",
+    "gas portfolio", "energy portfolio",
+    # Broad job terms (combined with feed-level filtering these are safe)
+    "natural gas analyst", "natural gas trader", "natural gas manager",
 ]
 
 # ── Target companies — highlighted in alerts when matched ─────────────────────

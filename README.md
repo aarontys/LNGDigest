@@ -117,16 +117,38 @@ The job scraper monitors RSS feeds from Indeed (Singapore, Houston, London, Toky
 ### How it works
 
 1. Polls job feeds at configured times (default: 7:30 AM and 6:00 PM SGT)
-2. Filters by keywords: LNG, gas trading, origination, structuring, portfolio, quant, etc.
+2. Filters by job-specific keywords (role titles, not just company names)
 3. Deduplicates against `seen_jobs.json` — you only see each posting once
 4. Highlights target companies (JERA, Shell, Trafigura, Vitol, etc.) with a ⭐
 5. Sends alert to `JOB_RECIPIENTS` (just you by default, not colleagues)
 
+### Adding company career page coverage via Google Alerts
+
+Most IOCs and trading houses (Shell, BP, Trafigura, etc.) use Workday portals that don't offer RSS. To catch their postings when Google indexes them:
+
+1. Go to [google.com/alerts](https://www.google.com/alerts)
+2. Create an alert, e.g. `Shell LNG careers OR jobs`
+3. Click "Show options" → set **Deliver to: RSS feed**
+4. Copy the RSS feed URL (right-click the RSS icon → Copy link address)
+5. Paste the URL into `JOB_FEEDS` in `digest_config.py`
+6. Repeat for each target company
+
+Suggested alerts to create:
+- `Shell LNG careers OR jobs`
+- `BP LNG careers OR jobs`
+- `TotalEnergies LNG careers OR jobs`
+- `Trafigura LNG OR gas careers OR jobs`
+- `Woodside LNG careers OR jobs`
+- `JERA LNG careers OR jobs`
+- `Pavilion Energy careers OR jobs`
+- `Cheniere LNG careers OR jobs`
+- `Vitol energy trading careers OR jobs`
+
 ### Customising
 
 Edit `digest_config.py`:
-- `JOB_FEEDS` — add/remove job board RSS URLs
-- `JOB_KEYWORDS` — terms that must match in title/description
+- `JOB_FEEDS` — add/remove job board RSS URLs or Google Alert feeds
+- `JOB_KEYWORDS` — job-specific terms that must match in title/description
 - `JOB_TARGET_COMPANIES` — companies flagged with ⭐ when matched
 - `JOB_RECIPIENTS` — who gets job alerts (separate from news recipients)
 - `JOB_TIMES` — when to check for new postings
@@ -142,7 +164,7 @@ Job alerts go only to `JOB_RECIPIENTS` by default (just you).
 
 ## Google News URL Resolution
 
-Google News RSS returns opaque redirect URLs (`https://news.google.com/rss/articles/CBMi...`) instead of direct article links. The digest resolves these using three strategies (in order): extracting the real URL from RSS entry metadata, decoding the Base64-encoded payload in the URL, and falling back to HTTP redirect following. The first two are fast and don't make network calls.
+Google News RSS returns opaque redirect URLs (`https://news.google.com/rss/articles/CBMi...`) instead of direct article links. The news digest resolves these using three strategies (in order): extracting the article URL from `<a href>` tags in the RSS description HTML, decoding the Base64-encoded payload in the URL path, and falling back to HTTP redirect following. The first two are fast and don't make network calls.
 
 ## Costs
 
